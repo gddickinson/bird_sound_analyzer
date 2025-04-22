@@ -1,0 +1,37 @@
+# Sound Analyzer Configuration
+
+# Audio settings
+audio:
+  sample_rate: 44100
+  chunk_size: 1024
+  channels: 1
+  n_fft: 2048
+  hop_length: 512
+  window: hann
+  min_freq: 0
+  max_freq: 22050  # Nyquist frequency
+  history_seconds: 5
+
+# Plugin configuration
+plugins:
+  enabled:
+    - birdnet  # List of enabled plugins
+  
+  # BirdNET plugin settings
+  birdnet:
+    confidence_threshold: 0.5
+    analysis_interval: 3.0
+    detection_window: 3.0
+    overlap: 0.0
+    max_results: 10
+    use_location: false
+    latitude: null
+    longitude: null
+
+# UI settings
+ui:
+  theme: light  # light or dark
+  window_size:
+    - 1200
+    - 800
+  auto_start: false
