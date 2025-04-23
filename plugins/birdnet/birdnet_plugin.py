@@ -1,5 +1,5 @@
 """
-BirdNET plugin for Sound Analyzer with enhanced debugging.
+BirdNET plugin for Sound Analyzer with working automatic analysis.
 Identifies bird species in audio using the BirdNET library.
 """
 import numpy as np
@@ -51,6 +51,9 @@ from plugins.base_plugin import BasePlugin
 # Set up a separate logger for this plugin
 logger = logging.getLogger(__name__)
 
+# Make sure the logger is set to capture DEBUG level messages
+logger.setLevel(logging.DEBUG)
+
 class PluginLogHandler(logging.Handler):
     """Custom log handler to capture logs for display in plugin UI."""
 
@@ -88,7 +91,6 @@ plugin_log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s -
 
 # Add the custom handler to the logger
 logger.addHandler(plugin_log_handler)
-logger.setLevel(logging.DEBUG)
 
 
 class BirdNETAnalysisThread(QThread):
@@ -416,6 +418,10 @@ class BirdNETPlugin(BasePlugin):
     """
     BirdNET plugin for bird species identification.
     """
+    # Declare class attributes
+    auto_analysis_timer = None
+    buffer_update_timer = None
+    debug_timer = None
 
     def __init__(self, audio_processor, config):
         """
@@ -464,6 +470,14 @@ class BirdNETPlugin(BasePlugin):
         self.status_label = None
         self.log_display = None
         self.progress_bar = None
+        self.buffer_label = None
+
+        # Initialize auto-analysis timer
+        self.auto_analysis_timer = QTimer()
+        self.auto_analysis_timer.setObjectName("auto_analysis_timer")
+        self.auto_analysis_timer.timeout.connect(self.check_auto_analysis)
+        self.auto_analysis_timer.start(500)  # Check every 500ms
+        logger.info(f"Auto-analysis timer started with {self.analysis_interval}s interval")
 
         # Debug timer to log buffer status periodically
         self.debug_timer = QTimer()
@@ -478,6 +492,9 @@ class BirdNETPlugin(BasePlugin):
         logger.info(f"BirdNET Plugin initialized with: confidence_threshold={self.confidence_threshold}, "
                     f"analysis_interval={self.analysis_interval}s, detection_window={self.detection_window}s, "
                     f"use_location={self.use_location}, latitude={self.latitude}, longitude={self.longitude}")
+
+        # Force check auto-analysis soon after initialization
+        QTimer.singleShot(5000, self.check_auto_analysis)
 
     def _log_buffer_status(self):
         """
@@ -572,19 +589,50 @@ class BirdNETPlugin(BasePlugin):
         if len(self.buffer) > max_samples:
             self.buffer = self.buffer[-max_samples:]
 
-        # Check if it's time to run analysis
-        current_time = time.time()
-        if (current_time - self.last_analysis_time >= self.analysis_interval and
-            len(self.buffer) >= max_samples * 0.5 and  # At least 50% full (was 80%)
-            not self.analysis_thread_running):
-
-            logger.info(f"Starting analysis after {current_time - self.last_analysis_time:.2f} seconds")
-            # Start analysis in a background thread to avoid blocking the UI
-            self.start_analysis()
-            self.last_analysis_time = current_time
-
         # Return current species list
         return {'species': self.results}
+
+    def check_auto_analysis(self):
+        """
+        Check if it's time for automatic analysis.
+        This is called by the timer at regular intervals.
+        """
+        # Always log current status for debugging
+        current_time = time.time()
+        time_since_last = current_time - self.last_analysis_time
+        max_samples = int(self.detection_window * self.sample_rate)
+        buffer_seconds = len(self.buffer) / self.sample_rate if self.sample_rate > 0 else 0
+        buffer_percentage = len(self.buffer) / max_samples * 100 if max_samples > 0 else 0
+
+        # Log every check to see what's happening
+        logger.debug(
+            f"Auto-analysis check: time_since={time_since_last:.1f}s (interval={self.analysis_interval:.1f}s), "
+            f"buffer={buffer_seconds:.2f}s/{self.detection_window:.1f}s ({buffer_percentage:.0f}%), "
+            f"recording={self.is_recording}, running={self.analysis_thread_running}"
+        )
+
+        # Skip if analysis is already running
+        if self.analysis_thread_running:
+            logger.debug("Auto-analysis skipped: Analysis already running")
+            return
+
+        # Detailed conditions check with logging
+        if not self.is_recording:
+            logger.debug("Auto-analysis skipped: Not recording")
+            return
+
+        if time_since_last < self.analysis_interval:
+            logger.debug(f"Auto-analysis skipped: Last analysis too recent ({time_since_last:.1f}s < {self.analysis_interval:.1f}s)")
+            return
+
+        if len(self.buffer) < max_samples * 0.4:
+            logger.debug(f"Auto-analysis skipped: Buffer too small ({buffer_percentage:.0f}% < 40%)")
+            return
+
+        # If we got here, all conditions are met - trigger analysis
+        logger.info(f"Auto-analysis triggered after {time_since_last:.2f}s with {buffer_seconds:.2f}s of audio ({buffer_percentage:.0f}%)")
+        self.start_analysis()
+        self.last_analysis_time = current_time
 
     def start_analysis(self):
         """
@@ -902,6 +950,12 @@ class BirdNETPlugin(BasePlugin):
             test_sound_btn.clicked.connect(self._generate_test_sound)
             settings_layout.addRow("", test_sound_btn)
 
+            # Add auto-analysis toggle
+            auto_analysis_check = QCheckBox("Enable Auto Analysis")
+            auto_analysis_check.setChecked(True)  # Default to enabled
+            auto_analysis_check.stateChanged.connect(lambda state: self._toggle_auto_analysis(state))
+            settings_layout.addRow("", auto_analysis_check)
+
             status_layout.addLayout(settings_layout)
 
         main_layout.addWidget(status_group)
@@ -980,6 +1034,29 @@ class BirdNETPlugin(BasePlugin):
         self.buffer_update_timer.timeout.connect(self._update_buffer_display)
         self.buffer_update_timer.start(1000)  # Update every second
 
+        # Force debugging output soon after UI initialization
+        QTimer.singleShot(3000, lambda: logger.info("UI initialized and timers running"))
+
+    def _toggle_auto_analysis(self, state):
+        """
+        Toggle auto-analysis on or off.
+
+        Args:
+            state: Qt.Checked or Qt.Unchecked
+        """
+        if state == Qt.Checked:
+            if not self.auto_analysis_timer.isActive():
+                self.auto_analysis_timer.start(500)
+                logger.info("Auto-analysis enabled")
+                if self.status_label:
+                    self.status_label.setText("Status: Auto-analysis enabled")
+        else:
+            if self.auto_analysis_timer.isActive():
+                self.auto_analysis_timer.stop()
+                logger.info("Auto-analysis disabled")
+                if self.status_label:
+                    self.status_label.setText("Status: Auto-analysis disabled")
+
     def _update_buffer_display(self):
         """
         Update the buffer status display.
@@ -1028,9 +1105,6 @@ class BirdNETPlugin(BasePlugin):
 
             # Normalize to prevent clipping
             test_sound = test_sound / np.max(np.abs(test_sound)) * 0.9
-
-            # Play the sound on default audio output
-            # (this is optional and requires additional setup for audio output)
 
             # Add sound to buffer for analysis
             self.buffer = test_sound
@@ -1158,16 +1232,21 @@ class BirdNETPlugin(BasePlugin):
         """
         Perform cleanup when shutting down the plugin.
         """
+        # First stop the auto-analysis timer
+        if self.auto_analysis_timer and self.auto_analysis_timer.isActive():
+            logger.info("Stopping auto-analysis timer")
+            self.auto_analysis_timer.stop()
+
         # Stop any ongoing analysis
         if self.analysis_thread and self.analysis_thread.isRunning():
             logger.info("Stopping analysis thread")
             self.analysis_thread.quit()
             self.analysis_thread.wait()
 
-        # Stop timers
-        if hasattr(self, 'buffer_update_timer'):
+        # Stop other timers
+        if hasattr(self, 'buffer_update_timer') and self.buffer_update_timer and self.buffer_update_timer.isActive():
             self.buffer_update_timer.stop()
-        if hasattr(self, 'debug_timer'):
+        if hasattr(self, 'debug_timer') and self.debug_timer and self.debug_timer.isActive():
             self.debug_timer.stop()
 
         # Remove log observer
@@ -1198,3 +1277,6 @@ class BirdNETPlugin(BasePlugin):
                 max_samples = int(self.detection_window * self.sample_rate)
                 if len(self.buffer) > max_samples:
                     self.buffer = self.buffer[-max_samples:]
+
+                # Set recording to true to ensure automatic analysis works
+                self.is_recording = True
