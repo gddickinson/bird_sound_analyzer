@@ -12,11 +12,16 @@ audio:
   max_freq: 22050  # Nyquist frequency
   history_seconds: 5
 
+  # Speaker output settings
+  enable_speaker_output: true  # Enable speaker output by default
+  output_volume: 1.0  # Range: 0.0 to 1.0
+  output_device_index: null  # Use system default output device
+
 # Plugin configuration
 plugins:
   enabled:
     - birdnet  # List of enabled plugins
-  
+
   # BirdNET plugin settings
   birdnet:
     confidence_threshold: 0.5
