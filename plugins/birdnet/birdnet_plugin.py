@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (
     QComboBox, QHeaderView, QGroupBox, QFormLayout, QDoubleSpinBox,
     QProgressBar, QTextEdit, QSplitter, QDialog, QFileDialog, QMessageBox
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject, pyqtSignal, QMetaObject, Q_ARG, QGenericArgument
 from PyQt5.QtGui import QColor, QTextCursor
 from utils.detection_db import get_db_instance
 
@@ -111,15 +111,33 @@ plugin_log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s -
 logger.addHandler(plugin_log_handler)
 
 
+class UISignals(QObject):
+    """
+    Signals for safe UI updates from threads.
+    """
+    # Signal for updating log display
+    log_update = pyqtSignal(str)
+
+    # Signal for updating status label
+    status_update = pyqtSignal(str)
+
+    # Signal for updating progress bar
+    progress_update = pyqtSignal(int)
+
+    # Signal for showing/hiding progress bar
+    progress_visibility = pyqtSignal(bool)
+
+    # Signal for analysis complete
+    analysis_complete = pyqtSignal(list)
+
 class BirdNETAnalysisThread(QThread):
     """
     Thread for running BirdNET analysis in the background.
     """
-    analysis_complete = pyqtSignal(list)
-    analysis_progress = pyqtSignal(int)  # Progress in percentage (0-100)
+
 
     def __init__(self, model, audio_data, sample_rate, detection_window,
-                 confidence_threshold, lat=None, lon=None, week=None):
+                confidence_threshold, ui_signals, lat=None, lon=None, week=None):
         """
         Initialize the analysis thread.
 
@@ -129,15 +147,18 @@ class BirdNETAnalysisThread(QThread):
             sample_rate: Sample rate of the audio data
             detection_window: Size of detection window in seconds
             confidence_threshold: Minimum confidence threshold
+            ui_signals: Signals for UI updates
             lat: Optional latitude for species filtering
             lon: Optional longitude for species filtering
             week: Optional week number for species filtering
         """
         super().__init__()
 
+        # Add ui_signals parameter
+        self.ui_signals = ui_signals
+
         # Generate a unique ID for this analysis
         self.analysis_id = str(uuid.uuid4())[:8]
-
         self.model = model
         self.audio_data = audio_data
         self.sample_rate = sample_rate
@@ -169,7 +190,7 @@ class BirdNETAnalysisThread(QThread):
         """
         try:
             logger.info(f"[Analysis {self.analysis_id}] Starting BirdNET analysis using {BIRDNET_TYPE}")
-            self.analysis_progress.emit(10)  # Starting
+            self.ui_signals.progress_update.emit(10)  # Starting
 
             if BIRDNET_TYPE == "birdnet":
                 results = self._analyze_with_birdnet()
@@ -182,14 +203,14 @@ class BirdNETAnalysisThread(QThread):
             for idx, result in enumerate(results):
                 logger.info(f"[Analysis {self.analysis_id}] Detection {idx+1}: {result[1]} ({result[0]}) with confidence {result[2]:.4f}")
 
-            self.analysis_progress.emit(100)  # Complete
-            self.analysis_complete.emit(results)
+            self.ui_signals.progress_update.emit(100)  # Complete
+            self.ui_signals.analysis_complete.emit(results)
 
         except Exception as e:
             logger.error(f"[Analysis {self.analysis_id}] Error in BirdNET analysis: {e}")
             logger.error(f"[Analysis {self.analysis_id}] Traceback: {traceback.format_exc()}")
-            self.analysis_progress.emit(100)  # Complete
-            self.analysis_complete.emit([])
+            self.ui_signals.progress_update.emit(100)  # Complete
+            self.ui_signals.analysis_complete.emit([])
 
     def _analyze_with_birdnet(self):
         """
@@ -213,7 +234,7 @@ class BirdNETAnalysisThread(QThread):
                 wf.writeframes(audio_int16.tobytes())
 
             logger.debug(f"[Analysis {self.analysis_id}] Created temporary WAV file at {temp_path}")
-            self.analysis_progress.emit(30)  # File created
+            self.ui_signals.progress_update.emit(30)  # File created
 
             # Get species in the area if location is specified
             filter_species = None
@@ -227,14 +248,14 @@ class BirdNETAnalysisThread(QThread):
 
             # Analyze the audio file
             logger.info(f"[Analysis {self.analysis_id}] Running BirdNET analysis on audio file")
-            self.analysis_progress.emit(50)  # Analysis started
+            self.ui_signals.progress_update.emit(50)  # Analysis started
 
             predictions = self.model.predict_species_within_audio_file(
                 Path(temp_path),
                 filter_species=filter_species
             )
 
-            self.analysis_progress.emit(80)  # Processing results
+            self.ui_signals.progress_update.emit(80)  # Processing results
 
             # Process the results
             results = []
@@ -291,7 +312,7 @@ class BirdNETAnalysisThread(QThread):
                 wf.writeframes(audio_int16.tobytes())
 
             logger.debug(f"[Analysis {self.analysis_id}] Created temporary WAV file at {temp_path}, size: {os.path.getsize(temp_path)} bytes")
-            self.analysis_progress.emit(30)  # File created
+            self.ui_signals.progress_update.emit(30)  # File created
 
             # Import required modules
             try:
@@ -340,7 +361,7 @@ class BirdNETAnalysisThread(QThread):
 
             # Run analysis
             logger.info(f"[Analysis {self.analysis_id}] Running BirdNETLib analysis on audio file")
-            self.analysis_progress.emit(50)  # Analysis started
+            self.ui_signals.progress_update.emit(50)  # Analysis started
 
             try:
                 # Try with analyzer already in recording
@@ -361,7 +382,7 @@ class BirdNETAnalysisThread(QThread):
                 raise AttributeError("Cannot find detections in either recording or analyzer")
 
             logger.info(f"[Analysis {self.analysis_id}] Found {len(detections)} detections")
-            self.analysis_progress.emit(80)  # Processing results
+            self.ui_signals.progress_update.emit(80)  # Processing results
 
             # Process the results
             results = []
@@ -547,6 +568,17 @@ class BirdNETPlugin(BasePlugin):
 
         # Force check auto-analysis soon after initialization
         QTimer.singleShot(5000, self.check_auto_analysis)
+
+        # Create UI signals
+        self.ui_signals = UISignals()
+
+        # Connect signals to UI update methods
+        self.ui_signals.log_update.connect(self._safe_update_log)
+        self.ui_signals.status_update.connect(self._safe_update_status)
+        self.ui_signals.progress_update.connect(self._safe_update_progress)
+        self.ui_signals.progress_visibility.connect(self._safe_update_progress_visibility)
+        self.ui_signals.analysis_complete.connect(self._safe_handle_analysis_results)
+
 
     def _log_buffer_status(self):
         """
@@ -766,12 +798,10 @@ class BirdNETPlugin(BasePlugin):
                 self.sample_rate,
                 self.detection_window,
                 self.confidence_threshold,
+                self.ui_signals,  # Pass UI signals
                 lat, lon, week
             )
 
-            # Connect signals
-            self.analysis_thread.analysis_complete.connect(self.handle_analysis_results)
-            self.analysis_thread.analysis_progress.connect(self.update_progress)
 
             # Start the thread
             self.analysis_thread.start()
@@ -783,73 +813,7 @@ class BirdNETPlugin(BasePlugin):
             if self.status_label:
                 self.status_label.setText(f"Status: Analysis error: {str(e)[:30]}...")
 
-    def update_progress(self, progress):
-        """
-        Update the analysis progress.
 
-        Args:
-            progress: Progress percentage (0-100)
-        """
-        self.analysis_progress = progress
-        if self.progress_bar:
-            self.progress_bar.setValue(progress)
-
-    def handle_analysis_results(self, results):
-        """
-        Handle the results from BirdNET analysis.
-
-        Note: This is a replacement for the original handle_analysis_results
-        method to add database storage.
-
-        Args:
-            results: List of (scientific_name, common_name, confidence, time) tuples
-        """
-        logger.info(f"Received analysis results: {len(results)} detections")
-
-        # Make sure database is initialized
-        if not hasattr(self, 'db') or self.db is None:
-            self._init_database()
-
-        # Update results list with new species
-        for scientific, common, confidence, time_start in results:
-            # Save to database first - use a copy of the buffer for the specific detection
-            # This gives us the audio segment that triggered this detection
-            buffer_copy = self.buffer.copy()
-            self._save_detection_to_db(scientific, common, confidence, buffer_copy)
-
-            # Check if species is already in the list
-            existing = next((r for r in self.results if r[0] == scientific), None)
-
-            if existing:
-                # Update existing entry if new confidence is higher
-                if confidence > existing[2]:
-                    logger.info(f"Updating existing species: {scientific} ({common}) with higher confidence: {confidence:.4f} > {existing[2]:.4f}")
-                    existing[2] = confidence  # Update confidence
-                    existing[3] = time.time()  # Update timestamp
-            else:
-                # Add new species to the list
-                logger.info(f"Adding new species: {scientific} ({common}) with confidence: {confidence:.4f}")
-                self.results.append([scientific, common, confidence, time.time()])
-
-                # Sort by confidence (highest first) and keep only max_results
-                self.results.sort(key=lambda x: x[2], reverse=True)
-                if len(self.results) > self.max_results:
-                    removed = self.results[self.max_results:]
-                    self.results = self.results[:self.max_results]
-                    logger.info(f"Removed {len(removed)} results to keep only the top {self.max_results}")
-
-        # Update the UI
-        self.update_results_table()
-
-        # Clean up the analysis thread safely
-        self._cleanup_analysis_thread()
-
-        # Update status label
-        if self.status_label:
-            if len(results) > 0:
-                self.status_label.setText(f"Status: Detected and saved {len(results)} species")
-            else:
-                self.status_label.setText("Status: No birds detected")
 
     def update_results_table(self):
         """
@@ -1345,17 +1309,10 @@ class BirdNETPlugin(BasePlugin):
 
     def _on_log_update(self, log_entry):
         """
-        Handle a new log entry.
-
-        Args:
-            log_entry: The log entry string
+        Thread-safe handler for log updates.
         """
-        if self.log_display:
-            self.log_display.append(log_entry)
-            # Scroll to bottom
-            cursor = self.log_display.textCursor()
-            cursor.movePosition(QTextCursor.End)
-            self.log_display.setTextCursor(cursor)
+        # Emit signal to update log in the main thread
+        self.ui_signals.log_update.emit(log_entry)
 
     def clear_results(self):
         """
@@ -2123,3 +2080,93 @@ class BirdNETPlugin(BasePlugin):
 
         except Exception as e:
             logger.error(f"Error checking memory usage: {e}")
+
+    def _safe_update_log(self, log_entry):
+        """
+        Safely update log display from any thread.
+        """
+        if self.log_display:
+            self.log_display.append(log_entry)
+            # Scroll to bottom
+            cursor = self.log_display.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.log_display.setTextCursor(cursor)
+
+    def _safe_update_status(self, status_text):
+        """
+        Safely update status label from any thread.
+        """
+        if self.status_label:
+            self.status_label.setText(status_text)
+
+    def _safe_update_progress(self, value):
+        """
+        Safely update progress bar from any thread.
+        """
+        if self.progress_bar:
+            self.progress_bar.setValue(value)
+
+    def _safe_update_progress_visibility(self, visible):
+        """
+        Safely show/hide progress bar from any thread.
+        """
+        if self.progress_bar:
+            self.progress_bar.setVisible(visible)
+
+    def _safe_handle_analysis_results(self, results):
+        """
+        Safely handle analysis results from the worker thread.
+        """
+        # This runs in the main UI thread, so it's safe to update UI
+        logger.info(f"Handling {len(results)} detection results in main thread")
+
+        # Make sure database is initialized
+        if not hasattr(self, 'db') or self.db is None:
+            self._init_database()
+
+        # Update results list with new species
+        for scientific, common, confidence, time_start in results:
+            # Save to database first - use a copy of the buffer for the specific detection
+            # This gives us the audio segment that triggered this detection
+            buffer_copy = self.buffer.copy()
+            self._save_detection_to_db(scientific, common, confidence, buffer_copy)
+
+            # Check if species is already in the list
+            existing = next((r for r in self.results if r[0] == scientific), None)
+
+            if existing:
+                # Update existing entry if new confidence is higher
+                if confidence > existing[2]:
+                    logger.info(f"Updating existing species: {scientific} ({common}) with higher confidence: {confidence:.4f} > {existing[2]:.4f}")
+                    existing[2] = confidence  # Update confidence
+                    existing[3] = time.time()  # Update timestamp
+            else:
+                # Add new species to the list
+                logger.info(f"Adding new species: {scientific} ({common}) with confidence: {confidence:.4f}")
+                self.results.append([scientific, common, confidence, time.time()])
+
+                # Sort by confidence (highest first) and keep only max_results
+                self.results.sort(key=lambda x: x[2], reverse=True)
+                if len(self.results) > self.max_results:
+                    removed = self.results[self.max_results:]
+                    self.results = self.results[:self.max_results]
+                    logger.info(f"Removed {len(removed)} results to keep only the top {self.max_results}")
+
+        # Update the UI
+        self.update_results_table()
+
+        # Clear the analysis thread
+        self.analysis_thread_running = False
+        self.analysis_thread = None
+        logger.info("Analysis thread completed")
+
+        # Hide progress bar
+        if self.progress_bar:
+            self.progress_bar.setVisible(False)
+
+        # Update status label
+        if self.status_label:
+            if len(results) > 0:
+                self.status_label.setText(f"Status: Detected and saved {len(results)} species")
+            else:
+                self.status_label.setText("Status: No birds detected")
