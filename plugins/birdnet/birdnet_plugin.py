@@ -16,6 +16,9 @@ import wave
 import uuid
 import sys
 import sqlite3
+import gc
+import psutil
+
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -49,6 +52,19 @@ except ImportError:
             pass
 
 from plugins.base_plugin import BasePlugin
+
+def _exception_hook(exctype, value, traceback):
+    """
+    Global exception hook to log unhandled exceptions.
+    """
+    logger.critical(f"Unhandled exception: {exctype.__name__}: {value}")
+    logger.critical("".join(traceback.format_tb(traceback)))
+
+    # Call original exception hook
+    sys.__excepthook__(exctype, value, traceback)
+
+# Replace the default exception hook
+sys.excepthook = _exception_hook
 
 # Set up a separate logger for this plugin
 logger = logging.getLogger(__name__)
@@ -258,6 +274,13 @@ class BirdNETAnalysisThread(QThread):
             temp_path = temp_file.name
 
         try:
+
+            # Check audio level before processing
+            rms = np.sqrt(np.mean(np.square(self.audio_data)))
+            if rms < 0.001:
+                logger.warning(f"[Analysis {self.analysis_id}] Audio too quiet for reliable detection (RMS={rms:.5f})")
+                return []  # Return empty results instead of attempting analysis
+
             # Write audio data to the temporary file
             with wave.open(temp_path, 'wb') as wf:
                 wf.setnchannels(1)
@@ -271,22 +294,35 @@ class BirdNETAnalysisThread(QThread):
             self.analysis_progress.emit(30)  # File created
 
             # Import required modules
-            from birdnetlib import Recording
-            from birdnetlib.analyzer import Analyzer
-
-            # Create analyzer first
-            analyzer = Analyzer()
-            logger.info(f"[Analysis {self.analysis_id}] Created analyzer")
-
-            # Create a Recording object with analyzer
             try:
-                recording = Recording(analyzer, temp_path)
-                logger.info(f"[Analysis {self.analysis_id}] Created recording with analyzer parameter")
-            except TypeError as e:
-                # Try alternative API where analyzer is passed to analyze_recording
-                logger.warning(f"[Analysis {self.analysis_id}] Error with analyzer parameter, trying alternative API: {e}")
-                recording = Recording(temp_path)
-                logger.info(f"[Analysis {self.analysis_id}] Created recording without analyzer parameter")
+                from birdnetlib import Recording
+                from birdnetlib.analyzer import Analyzer
+            except ImportError as e:
+                logger.error(f"[Analysis {self.analysis_id}] Failed to import birdnetlib: {e}")
+                return []
+
+
+            # Create analyzer with memory management
+            try:
+                # Limit threads to prevent memory issues
+                os.environ['OMP_NUM_THREADS'] = '1'
+                os.environ['MKL_NUM_THREADS'] = '1'
+
+                analyzer = Analyzer()
+                logger.info(f"[Analysis {self.analysis_id}] Created analyzer")
+
+                # Create Recording object with error handling
+                try:
+                    recording = Recording(analyzer, temp_path)
+                    logger.info(f"[Analysis {self.analysis_id}] Created recording with analyzer parameter")
+                except Exception as e:
+                    logger.warning(f"[Analysis {self.analysis_id}] Error with analyzer parameter: {e}")
+                    recording = Recording(temp_path)
+                    logger.info(f"[Analysis {self.analysis_id}] Created recording without analyzer parameter")
+
+            except Exception as e:
+                logger.error(f"[Analysis {self.analysis_id}] Error creating analyzer: {e}")
+                return []
 
             # Try to set location data if supported
             try:
@@ -486,6 +522,16 @@ class BirdNETPlugin(BasePlugin):
         self.debug_timer.timeout.connect(self._log_buffer_status)
         self.debug_timer.start(50000)  # Log every 5 seconds
 
+        # Start a timer for garbage collection
+        self.gc_timer = QTimer()
+        self.gc_timer.timeout.connect(self._force_garbage_collection)
+        self.gc_timer.start(30000)  # Run every 30 seconds
+
+        # Start a timer for memory monitoring
+        self.memory_timer = QTimer()
+        self.memory_timer.timeout.connect(self._check_memory_usage)
+        self.memory_timer.start(10000)  # Check every 10 seconds
+
         # Initialize BirdNET model if available
         self.model = None
         self.init_birdnet_model()
@@ -603,6 +649,22 @@ class BirdNETPlugin(BasePlugin):
         Check if it's time for automatic analysis.
         This is called by the timer at regular intervals.
         """
+        # recovery logic - check if thread is stuck
+        if self.analysis_thread_running:
+            # Check how long the thread has been running
+            if hasattr(self, 'analysis_start_time'):
+                thread_runtime = time.time() - self.analysis_start_time
+
+                # If thread has been running for more than 30 seconds, it's likely stuck
+                if thread_runtime > 30:
+                    logger.warning(f"Analysis thread appears to be stuck (running for {thread_runtime:.1f}s)")
+                    self._restart_analysis_system()
+                    return
+
+            logger.debug("Auto-analysis skipped: Analysis already running")
+            return
+
+
         # Always log current status for debugging
         current_time = time.time()
         time_since_last = current_time - self.last_analysis_time
@@ -622,6 +684,14 @@ class BirdNETPlugin(BasePlugin):
             logger.debug("Auto-analysis skipped: Analysis already running")
             return
 
+        # audio level check - skip very quiet audio
+        if len(self.buffer) > 0:
+            rms = np.sqrt(np.mean(np.square(self.buffer)))
+            if rms < 0.001:  # Threshold for "too quiet"
+                logger.debug(f"Auto-analysis skipped: Audio too quiet (RMS={rms:.5f})")
+                return
+
+
         # Detailed conditions check with logging
         if not self.is_recording:
             logger.debug("Auto-analysis skipped: Not recording")
@@ -635,10 +705,14 @@ class BirdNETPlugin(BasePlugin):
             logger.debug(f"Auto-analysis skipped: Buffer too small ({buffer_percentage:.0f}% < 40%)")
             return
 
-        # If we got here, all conditions are met - trigger analysis
-        logger.info(f"Auto-analysis triggered after {time_since_last:.2f}s with {buffer_seconds:.2f}s of audio ({buffer_percentage:.0f}%)")
-        self.start_analysis()
-        self.last_analysis_time = current_time
+        # If we decide to start analysis, record the start time
+        if time_since_last >= self.analysis_interval and len(self.buffer) >= max_samples * 0.4 and self.is_recording:
+            # Record when we start analysis
+            self.analysis_start_time = time.time()
+
+            logger.info(f"Auto-analysis triggered after {time_since_last:.2f}s with {buffer_seconds:.2f}s of audio ({buffer_percentage:.0f}%)")
+            self.start_analysis()
+            self.last_analysis_time = current_time
 
     def start_analysis(self):
         """
@@ -676,11 +750,19 @@ class BirdNETPlugin(BasePlugin):
             rms = np.sqrt(np.mean(np.square(self.buffer)))
             logger.info(f"Starting analysis with buffer: {len(self.buffer)} samples ({buffer_seconds:.2f} seconds), RMS={rms:.5f}")
 
-        # Create and start the analysis thread
+            # Normalize the audio if it's too quiet
+            if rms < 0.01:
+                normalized_buffer = self._normalize_audio(self.buffer.copy())
+            else:
+                normalized_buffer = self.buffer.copy()
+        else:
+            normalized_buffer = self.buffer.copy()
+
+        # Create and start the analysis thread with normalized buffer
         try:
             self.analysis_thread = BirdNETAnalysisThread(
                 self.model,
-                self.buffer.copy(),  # Copy buffer to avoid modification during analysis
+                normalized_buffer,  # Use normalized buffer
                 self.sample_rate,
                 self.detection_window,
                 self.confidence_threshold,
@@ -759,14 +841,8 @@ class BirdNETPlugin(BasePlugin):
         # Update the UI
         self.update_results_table()
 
-        # Clear the analysis thread
-        self.analysis_thread_running = False
-        self.analysis_thread = None
-        logger.info("Analysis thread completed")
-
-        # Hide progress bar
-        if self.progress_bar:
-            self.progress_bar.setVisible(False)
+        # Clean up the analysis thread safely
+        self._cleanup_analysis_thread()
 
         # Update status label
         if self.status_label:
@@ -1327,17 +1403,23 @@ class BirdNETPlugin(BasePlugin):
             logger.info("Stopping auto-analysis timer")
             self.auto_analysis_timer.stop()
 
-        # Stop any ongoing analysis
-        if self.analysis_thread and self.analysis_thread.isRunning():
-            logger.info("Stopping analysis thread")
-            self.analysis_thread.quit()
-            self.analysis_thread.wait()
+        # Clean up the analysis thread safely
+        self._cleanup_analysis_thread()
+
 
         # Stop other timers
         if hasattr(self, 'buffer_update_timer') and self.buffer_update_timer and self.buffer_update_timer.isActive():
             self.buffer_update_timer.stop()
         if hasattr(self, 'debug_timer') and self.debug_timer and self.debug_timer.isActive():
             self.debug_timer.stop()
+
+        # Stop the memory timer
+        if hasattr(self, 'memory_timer') and self.memory_timer and self.memory_timer.isActive():
+            self.memory_timer.stop()
+
+        # Stop the garbage collection timer
+        if hasattr(self, 'gc_timer') and self.gc_timer and self.gc_timer.isActive():
+            self.gc_timer.stop()
 
         # Remove log observer
         plugin_log_handler.remove_observer(self._on_log_update)
@@ -1849,3 +1931,195 @@ class BirdNETPlugin(BasePlugin):
                 "Export Error",
                 f"Error exporting detections: {e}"
             )
+
+    def _cleanup_analysis_thread(self):
+        """
+        Clean up the analysis thread safely.
+        """
+        try:
+            if self.analysis_thread:
+                # First try to quit gracefully
+                if self.analysis_thread.isRunning():
+                    logger.debug("Terminating analysis thread gracefully")
+                    self.analysis_thread.quit()
+
+                    # Wait with timeout
+                    if not self.analysis_thread.wait(3000):  # 3 second timeout
+                        logger.warning("Analysis thread did not terminate gracefully, forcing termination")
+                        self.analysis_thread.terminate()
+
+                        # Final forced wait
+                        if not self.analysis_thread.wait(2000):
+                            logger.error("Failed to terminate analysis thread")
+
+                # Delete the thread object
+                self.analysis_thread = None
+
+            # Reset state variables
+            self.analysis_thread_running = False
+            self.analysis_progress = 0
+
+            # Hide progress bar
+            if self.progress_bar:
+                self.progress_bar.setVisible(False)
+
+        except Exception as e:
+            logger.error(f"Error cleaning up analysis thread: {e}")
+            # Force reset of state variables
+            self.analysis_thread = None
+            self.analysis_thread_running = False
+
+    def _normalize_audio(self, audio_data, target_rms=0.05):
+        """
+        Normalize audio to a target RMS level if it's too quiet.
+
+        Args:
+            audio_data: Audio data as numpy array
+            target_rms: Target RMS level
+
+        Returns:
+            Normalized audio data
+        """
+        # Calculate current RMS
+        current_rms = np.sqrt(np.mean(np.square(audio_data)))
+
+        # Skip if audio is silent
+        if current_rms < 0.0001:
+            logger.debug(f"Audio is essentially silent (RMS={current_rms:.5f}), skipping normalization")
+            return audio_data
+
+        # Skip if already at acceptable level
+        if current_rms >= 0.01:
+            return audio_data
+
+        # Calculate gain
+        gain = target_rms / current_rms
+
+        # Apply gain with clipping protection
+        normalized_audio = audio_data * gain
+
+        # Clip to [-1.0, 1.0]
+        normalized_audio = np.clip(normalized_audio, -1.0, 1.0)
+
+        logger.info(f"Normalized audio from RMS={current_rms:.5f} to RMS={np.sqrt(np.mean(np.square(normalized_audio))):.5f}")
+
+        return normalized_audio
+
+    def _force_garbage_collection(self):
+        """
+        Force garbage collection to prevent memory leaks.
+        """
+        try:
+            collected = gc.collect()
+            logger.debug(f"Garbage collection completed, {collected} objects collected")
+        except Exception as e:
+            logger.error(f"Error during garbage collection: {e}")
+
+    def _cleanup_temp_files(self):
+        """
+        Clean up any temporary files from failed analyses.
+        """
+        try:
+            # Get system temp directory
+            temp_dir = tempfile.gettempdir()
+
+            # Look for our wav files
+            for filename in os.listdir(temp_dir):
+                if filename.startswith('tmp') and filename.endswith('.wav'):
+                    file_path = os.path.join(temp_dir, filename)
+
+                    # Check if file is older than 1 hour
+                    file_age = time.time() - os.path.getctime(file_path)
+                    if file_age > 3600:  # 1 hour in seconds
+                        try:
+                            os.remove(file_path)
+                            logger.debug(f"Removed old temporary file: {file_path}")
+                        except Exception as e:
+                            logger.error(f"Could not remove temporary file {file_path}: {e}")
+        except Exception as e:
+            logger.error(f"Error cleaning up temporary files: {e}")
+
+    def _restart_analysis_system(self):
+        """
+        Restart the analysis system after a crash or failure.
+        """
+        logger.warning("Restarting BirdNET analysis system")
+
+        # Force cleanup of any running thread
+        self._cleanup_analysis_thread()
+
+        # Force garbage collection
+        self._force_garbage_collection()
+
+        # Clean up temporary files
+        self._cleanup_temp_files()
+
+        # Reset state
+        self.analysis_thread_running = False
+        self.last_analysis_time = time.time()  # Reset timer to avoid immediate analysis
+
+        # Update UI if available
+        if self.status_label:
+            self.status_label.setText("Status: Analysis system restarted")
+
+        logger.info("BirdNET analysis system restarted")
+
+
+
+    def _safe_retry_analysis(self):
+        """
+        Safely retry analysis after a failure.
+        """
+        logger.info("Safely retrying analysis")
+
+        # Make sure we're completely cleaned up
+        self._cleanup_analysis_thread()
+        self._force_garbage_collection()
+
+        # Wait a short time to ensure resources are freed
+        time.sleep(0.5)
+
+        # Reset state
+        self.analysis_thread_running = False
+
+        # Try analysis again with a smaller buffer if available
+        if len(self.buffer) > 0:
+            # Use a smaller segment of the buffer to reduce memory usage
+            max_samples = int(self.detection_window * self.sample_rate)
+            if len(self.buffer) > max_samples:
+                retry_buffer = self.buffer[-max_samples:]
+            else:
+                retry_buffer = self.buffer
+
+            # Start analysis with reduced buffer
+            logger.info(f"Retrying analysis with {len(retry_buffer)} samples")
+            self.start_analysis()
+        else:
+            logger.warning("Cannot retry analysis - buffer is empty")
+
+    def _check_memory_usage(self):
+        """
+        Check system memory usage and take action if too high.
+        """
+        try:
+            # Get memory info
+            memory = psutil.virtual_memory()
+            memory_percent = memory.percent
+
+            if memory_percent > 90:  # If over 90% memory usage
+                logger.warning(f"High memory usage detected: {memory_percent}% used")
+
+                # Force garbage collection
+                self._force_garbage_collection()
+
+                # If still analyzing, consider stopping it
+                if self.analysis_thread_running and memory_percent > 95:
+                    logger.warning("Critical memory usage - stopping analysis")
+                    self._restart_analysis_system()
+
+                    # Update UI
+                    if self.status_label:
+                        self.status_label.setText("Status: Analysis aborted due to low memory")
+
+        except Exception as e:
+            logger.error(f"Error checking memory usage: {e}")
